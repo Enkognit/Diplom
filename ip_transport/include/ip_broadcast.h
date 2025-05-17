@@ -43,6 +43,8 @@ public:
 
     void ReceiveBroadcasts();
 
+    void ProcessNetworkUpdate();
+
     void ProcessHello(struct in_addr senderAddr, HelloMsg const &msg, bool needNotify = true);
 
     void ProcessPeerLost(int fd);
@@ -56,6 +58,7 @@ private:
 
     int broadcastTimerFd_ = -1;
     int broadcastFd_ = -1;
+    int netlinkFd_ = -1;
 
     std::mutex globalLock_;
     std::map<int, std::pair<PeerId, CancellationToken>> fdToPeer_;
@@ -63,6 +66,7 @@ private:
 
     std::map<PeerId, in_addr> peerToAddr_;
     std::map<in_addr_t, PeerId> addrToPeer_;
+    std::map<std::string, PeerId> ifToPeer_;
 
     friend IpTransport;
 };

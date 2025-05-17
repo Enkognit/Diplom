@@ -1,321 +1,314 @@
+from dataclasses import dataclass
 import os
+from pathlib import Path
+import re
 import argparse
-import sys
-from collections import defaultdict
-from pathlib import Path, PurePath
-
-parsed_list = []
-
-config_name = "config.txt"
-
-mac_to_code = dict()
-
-NS3_START_TIME = 1000
+from datetime import datetime
 
 
-def parse_solo(solo_text: list[str], dir_name: str):
-    if len(solo_text) == 0:
-        print("Incorrect data in .dot file")
-        sys.exit(1)
+@dataclass
+class Event:
+    mac1: str
+    what: str
+    mac2: str
 
-    header = solo_text[0].split()[1]  # remove 'digraph' keyword and bracket
-    solo_text = solo_text[1:-1]  # remove header and closing bracket
-    timestamp = int(header.split("_")[-1])
-    uid = header.split("_")[1]
-    timestamp = int(header.split("_")[-1])
-    uid = header.split("_")[1]
 
-    visible_nodes = {}
-    visible_edges = set()
-    visible_edges_valid = defaultdict(int)
+def combine_logs(logs_path, duration):
+    mac_to_num = {}
+    all_events = []
+    
+    print(duration)
 
-    config_edges = set()
-
-    for line in solo_text:
-        line = line.strip()
-        if "->" not in line:
-            words = line.split()
-            short = words[0].strip()
-            long = words[4].strip(' "]')
-            visible_nodes[short] = long
-        else:
-            from_node, to_node = list(map(str.strip, line.split("->")))
-            to_node, col = to_node.split(" [")
-            col = col.split("=")[1][:-1]
-
-            edge = (visible_nodes[from_node], visible_nodes[to_node])
-
-            if col == '"blue"':
-                config_edges.add(edge)
-                continue
-
-            visible_edges_valid[edge] += 1
-            if visible_edges_valid[edge] < 2:
-                continue
-            elif visible_edges_valid[edge] == 2:
-                visible_edges.add(edge)
-            else:
-                print("Something is wrong in .dot file, edge appear 3 times")
-                sys.exit(1)
-
-    return (
-        timestamp,
-        uid,
-        list(visible_nodes.values()),
-        list(visible_edges),
-        dir_name,
-        list(config_edges),
+    start_pattern = re.compile(
+        r"\[(.*?)\]IpTransport:INFO:Start:IP transport started with pid: ([\dA-Fa-f:]{17})"
     )
+    neighbor_found_pattern = re.compile(
+        r"\[(.*?)\]IpTransport:INFO:OnNeighborFound:Found new neighbor: ([\dA-Fa-f:]{17})"
+    )
+    neighbor_lost_pattern = re.compile(
+        r"\[(.*?)\]IpTransport:INFO:OnNeighborLost:Lost neighbor: ([\dA-Fa-f:]{17})"
+    )
+    link_establish_pattern = re.compile(
+        r"\[(.*?)\]IpTransport:INFO:OnLinkEstablishing:(INCOMING|OUTGOING) session opened with peer ([\dA-Fa-f:]{17})"
+    )
+    link_closed_pattern = re.compile(
+        r"\[(.*?)\]IpTransport:INFO:OnLinkClosed:(INCOMING|OUTGOING) session closed with peer ([\dA-Fa-f:]{17})"
+    )
+    
+    time_start: datetime = None
+    
+    for filename in sorted(os.listdir(logs_path)):
+        if not filename.startswith('log_'):
+            continue
+        
+        log_start: datetime = None
+        file_path = os.path.join(logs_path, filename)
+
+        with open(file_path, 'r') as f:
+                    
+            for line in f:
+                line = line.strip()
+                start_match = start_pattern.match(line)
+                if start_match:
+                    log_start = datetime.strptime(start_match.group(1), "%H:%M:%S.%f")
+                    break
+                
+        if not log_start:
+            print(f'In log {filename} IP transport was not started')
+        elif not time_start or log_start < time_start:
+            time_start = log_start
+        
+    if not time_start:
+        print(f'IP transport was not started anywhere not started')
+        return {}, {}
+
+    for filename in sorted(os.listdir(logs_path)):
+        if not filename.startswith('log_'):
+            continue
+
+        log_num = filename.split('_')[1].split('.')[0]
+        file_path = os.path.join(logs_path, filename)
+        mac_address = None
+
+        with open(file_path, 'r') as f:
+                    
+            for line in f:
+                line = line.strip()
+
+                if not mac_address:
+                    start_match = start_pattern.match(line)
+                    if start_match:
+                        mac_address = start_match.group(2).upper()
+                        print('Found: ', mac_address)
+                        mac_to_num[mac_address] = log_num
+                    continue
+
+                event = None
+                time_str = None
+
+                if 'OnNeighborFound' in line:
+                    match = neighbor_found_pattern.match(line)
+                    if match:
+                        time_str = match.group(1)
+                        neighbor_mac = match.group(2).upper()
+                        event = Event(mac1=mac_address,
+                                      what="saw",
+                                      mac2=neighbor_mac)
+                elif 'OnNeighborLost' in line:
+                    match = neighbor_lost_pattern.match(line)
+                    if match:
+                        time_str = match.group(1)
+                        neighbor_mac = match.group(2).upper()
+                        event = Event(mac1=mac_address,
+                                      what="lost",
+                                      mac2=neighbor_mac)
+                elif 'OnLinkEstablishing' in line:
+                    match = link_establish_pattern.match(line)
+                    if match:
+                        time_str = match.group(1)
+                        direction = match.group(2)
+                        peer_mac = match.group(3).upper()
+                        event = Event(mac1=mac_address,
+                                      what=f"open {direction}",
+                                      mac2=peer_mac)
+                elif 'OnLinkClosed' in line:
+                    match = link_closed_pattern.match(line)
+                    if match:
+                        time_str = match.group(1)
+                        direction = match.group(2)
+                        peer_mac = match.group(3).upper()
+                        event = Event(mac1=mac_address,
+                                      what=f"close {direction}",
+                                      mac2=peer_mac)
+
+                if event and time_str and time_start:
+                    try:
+                        timestamp = datetime.strptime(time_str, "%H:%M:%S.%f") - time_start
+                        if timestamp.total_seconds() < duration:
+                            all_events.append((timestamp, event))
+                    except ValueError:
+                        continue
+
+    all_events.sort(key=lambda x: x[0])
+
+    return mac_to_num, all_events
+
+class Graph:
+    def __init__(self):
+        self.graph = {}
+    
+    def add_vertex(self, vertex):
+        if vertex not in self.graph:
+            self.graph[vertex] = []
+    
+    def add_edge(self, u, v):
+        self.add_vertex(u)
+        self.add_vertex(v)
+        self.graph[u].append(v)
+        self.graph[v].append(u)
+        
+    def erase_edge(self, u, v):
+        self.add_vertex(u)
+        self.add_vertex(v)
+        self.graph[u].remove(v)
+        self.graph[v].remove(u)
+    
+    def is_connected(self):
+        if not self.graph:
+            return True        
+        visited = set()
+        start_vertex = next(iter(self.graph))
+        stack = [start_vertex]
+        
+        while stack:
+            vertex = stack.pop()
+            if vertex not in visited:
+                visited.add(vertex)
+                for neighbor in self.graph.get(vertex, []):
+                    if neighbor not in visited:
+                        stack.append(neighbor)
+        
+        return len(visited) == len(self.graph)
+    
+    def __eq__(self, other):
+        return self.graph == other.graph
+
+def get_experiment_stats(mac_to_num, all_events):
+    
+    graph = Graph()
+    
+    for mac, num in mac_to_num.items():
+        graph.add_vertex(num)
+    
+    incoming = set()
+    outgoing = set()
+    
+    visible = set()
+    
+    conn_time: str = None
+    sync_time: str = None
+    
+    last_state = graph.is_connected()
+    
+    events = []
+    
+    for it in all_events:
+        time = it[0]
+        event = it[1]
+        
+        new_state = graph.is_connected()
+        
+        a = mac_to_num[event.mac1]
+        b = mac_to_num[event.mac2]
+        
+        if "saw" in event.what:
+            visible.add((a, b))
+            if (b, a) in visible:
+                events.append((time, f"{b} <> {a}"))
+                
+        if "lost" in event.what:
+            visible.remove((a, b))
+            if (b, a) in visible:
+                events.append((time, f"{b} >< {a}"))
+        
+        if "open" in event.what:    
+            if "INCOMING" in event.what:
+                incoming.add((a, b))
+                if (b, a) in outgoing:
+                    events.append((time, f"{b} -> {a}"))
+                    graph.add_edge(a, b)
+            if "OUTGOING" in event.what:
+                outgoing.add((a, b))
+                if (b, a) in incoming:
+                    events.append((time, f"{a} -> {b}"))
+                    graph.add_edge(a, b)
+            
+            new_state = graph.is_connected()
+                    
+        if "close" in event.what:    
+            if "INCOMING" in event.what:
+                incoming.remove((a, b))
+                if (b, a) in outgoing:
+                    events.append((time, f"{b} |> {a}"))
+                    graph.erase_edge(a, b)
+            if "OUTGOING" in event.what:
+                outgoing.remove((a, b))
+                if (b, a) in incoming:
+                    events.append((time, f"{a} |> {b}"))
+                    graph.erase_edge(a, b)
+                    
+            new_state = graph.is_connected()
+
+        if last_state == False and new_state == True:
+            conn_time = time
+            
+        last_state = new_state
+        
+        if last_state == True:
+            sync_time = time
+        else:
+            conn_time = None
+            sync_time = None
+            
+    return conn_time, sync_time, events
+        
 
 
-# all discovery edges
-configuration = set()
+def main(logs_path, output_dir, duration):
 
+    mac_to_num, all_events = combine_logs(logs_path, duration)
 
-def print_header(file):
-    printf = lambda cur_text: print(cur_text, file=file)
-    sorted_mac_to_code = dict(sorted(mac_to_code.items(), key=lambda item: item[1]))
-    for key in sorted_mac_to_code.keys():
-        printf(f"0 {key} {mac_to_code[key]}")
+    with open(output_dir / 'combined_log.txt', 'w') as f:
+        for mac, num in sorted(mac_to_num.items(), key=lambda x: int(x[1])):
+            f.write(f"{num}: {mac}\n")
+        f.write("\n")
+        for ev in all_events:
+            event = ev[1]
+            f.write(f"[{ev[0]}] {mac_to_num[event.mac1]} {event.what} {mac_to_num[event.mac2]}\n")
 
-
-def pretty_parse_logs(cur_logs, min_time: int):
-
-    has_dynamic: bool = False
-
-    curr_nodes = []
-    curr_edges = []
-    curr_config = []
-
-    file_content = []
-
-    for cur_log in cur_logs:
-
-        timestamp = cur_log[0] - min_time
-        new_nodes = cur_log[1]
-        new_edges = cur_log[2]
-        new_config = cur_log[3]
-
-        config_diff = (set(new_config) - set(curr_config)).union(
-            set(curr_config) - set(new_config)
-        )
-
-        if len(config_diff) > 0 and not has_dynamic:  # type: ignore
-            has_dynamic = True
-
-        for config in config_diff:
-            if config not in curr_config:
-                curr_config.append(config)
-                file_content.append(f"5 {timestamp} {config[0]} {config[1]}")
-                configuration.add(
-                    (timestamp, min(config[0], config[1]), max(config[0], config[1]), 1)
-                )
-
-            elif config not in new_config:
-                curr_config.remove(config)
-                file_content.append(f"6 {timestamp} {config[0]} {config[1]}")
-                configuration.add(
-                    (timestamp, min(config[0], config[1]), max(config[0], config[1]), 0)
-                )
-
-        node_diff = (set(new_nodes) - set(curr_nodes)).union(
-            set(curr_nodes) - set(new_nodes)
-        )
-        for node in node_diff:
-            if node not in curr_nodes:
-                curr_nodes.append(node)
-                file_content.append(f"1 {timestamp} {node}")
-            elif node not in new_nodes:
-                curr_nodes.remove(node)
-                file_content.append(f"3 {timestamp} {node}")
-
-        edge_diff = (set(new_edges) - set(curr_edges)).union(
-            set(curr_edges) - set(new_edges)
-        )
-        for edge in edge_diff:
-            if edge not in curr_edges:
-                curr_edges.append(edge)
-                file_content.append(f"2 {timestamp} {edge[0]} {edge[1]}")
-            elif edge not in new_edges:
-                curr_edges.remove(edge)
-                file_content.append(f"4 {timestamp} {edge[0]} {edge[1]}")
-
-    return file_content
-
-
-def process_solo(cur_logs, min_time: int):
-    clean_logs = list(map(lambda t: (t[0], t[2], t[3], t[5]), cur_logs))
-    clean_logs = sorted(clean_logs, key=lambda x: x[0])
-    return pretty_parse_logs(clean_logs, min_time)
-
-
-def mac_to_node_id(mac):
-    cur_sz = len(mac_to_code)
-    if not mac in mac_to_code.keys():
-        cur_sz += 1  # type: ignore
-        mac_to_code[mac] = cur_sz
-
-    return mac_to_code[mac]
-
-
-def clear_config():
-    visibility = sorted(configuration)  # type: ignore
-    results = []
-
-    for i in range(len(visibility)):
-        ok_del = False
-        for j in range(len(results) - 1, -1, -1):
-            f1 = visibility[i][1]
-            t1 = visibility[i][2]
-
-            if f1 < t1:
-                f1, t1 = t1, f1
-
-            f2 = results[j][1]
-            t2 = results[j][2]
-
-            if f2 < t2:
-                f2, t2 = t2, f2
-
-            if f1 == f2 and t1 == t2 and visibility[i][3] == visibility[j][3]:
-                ok_del = True
-                break
-        if not ok_del:
-            results.append(visibility[i])
-    return results
-
-
-def parse_all_nodes(macs):
-
-    cleared_configuration = clear_config()
-    present_macs = list(macs)
-    pretty_events = []
-    app_off_events = []
-    for event in cleared_configuration:
-        event = list(event)
-
-        if not event[1] in present_macs:
-            app_off_events.append([NS3_START_TIME, mac_to_node_id(event[1])])
-            present_macs.append(event[1])
-
-        if not event[2] in present_macs:
-            app_off_events.append([NS3_START_TIME, mac_to_node_id(event[2])])
-            present_macs.append(event[2])
-
-        event[1] = mac_to_node_id(event[1])
-        event[2] = mac_to_node_id(event[2])
-        pretty_events.append(event)
-    return pretty_events, app_off_events
-
-
-def create_config_file(graph_dir, pretty_events, app_off_events):
-
-    config_path = f"{os.path.dirname(graph_dir)}/{config_name}"
-    print("Generated config: ", config_path)
-    f = open(config_path, mode="w+")
-
-    n = len(mac_to_code)
-
-    f.write(f"{n}\n")
-    for i in range(1, n + 1):
-        f.write(f"{i}:\n")
-
-    for event in app_off_events:
-        f.write(f"{int(event[0]) + 1} app {event[1]} 0\n")
-    for event in pretty_events:
-        f.write(
-            f"{int(event[0]) // 1000 + NS3_START_TIME} link {event[1]} {event[2]} {event[3]}\n"
-        )
-    f.close()
-
+    print(f"Successfully created combined log at: {output_dir / 'graph.txt'}")
+    
+    conn_time, sync_time, events = get_experiment_stats(mac_to_num, all_events)
+    
+    with open(output_dir / 'graph.txt', 'w') as f:
+        for mac, num in sorted(mac_to_num.items(), key=lambda x: int(x[1])):
+            f.write(f"{num}: {mac}\n")
+        f.write("\n")
+        for ev in events:
+            f.write(f"[{ev[0]}] {ev[1]}\n")
+    
+    if conn_time:
+        print("Time to connect topology:", conn_time.total_seconds())
+        print("Time to synchronize topology:", sync_time.total_seconds())
+    else:
+        print("Topology is not connected")
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(
-        prog="combine_logs.py",
-        description="Create files for visualizator from .dot files",
-    )
-
-    parser.add_argument(
-        "-p",
-        "--path-to-visualization",
-        help="path to dir with .dot files.",
-        required=True,
-    )
-
-    parser.add_argument(
-        "-o",
-        "--path-to-output",
-        help="path to directory (may be non-existing) to put output.",
-        required=True,
-    )
-
-    parser.add_argument(
-        "-g",
-        "--generate-config",
-        action="store_true",
-        help="generate config.txt file from lsdb. File will be stored in parent directory for path-to-visualization.",
-        required=False,
-    )
+        description='Combine emulator log files', )
+    parser.add_argument('-l',
+                        '--logs-path',
+                        help='Path to directory containing log files',
+                        required=True)
+    parser.add_argument('-o',
+                        '--output_dir',
+                        help='Path to output dir for combined log file',
+                        required=True)
+    
+    parser.add_argument('-d',
+                        '--duration',
+                        help='Experiment duration',
+                        required=True)
 
     args = parser.parse_args()
 
-    graph_dir = Path(os.path.abspath(args.path_to_visualization))
-    if not os.path.exists(graph_dir):
-        print("Directory " + str(graph_dir) + " does not exist.")
-        sys.exit(1)
+    if not os.path.isdir(args.logs_path):
+        print(f"Error: Directory '{args.logs_path}' does not exist!")
+        exit(1)
 
-    pathdir = graph_dir.glob("*.dot")
-    logs = []
-    logs_by_uid = defaultdict(list)
-    for path in pathdir:
-        cur_dir = PurePath(os.path.basename(path).split("-")[1]).stem
-        with open(path) as fd:
-            full_text = fd.readlines()
-            text = []
-            for line in full_text:
-                text.append(line)
-                if "}" in line:
-                    logs.append(parse_solo(text, cur_dir))
-                    text = []
-    logs = sorted(logs, key=lambda x: x[0])
-    for log in logs:
-        logs_by_uid[log[1]].append(log)
+    logs_path = Path(args.logs_path).absolute()
+    output_dir = Path(args.output_dir).absolute()
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    min_time = 10**18
-    for key, value in logs_by_uid.items():
-        for graph in value:
-            min_time = min(min_time, graph[0])
-
-    print(f"Normalizing time in logs from {min_time // 1000} ms")
-
-    # save main log for each UID + enumerate present nodes
-    files_content = {}
-    log_cnt = 1
-    for key, value in logs_by_uid.items():
-        dir_name = value[0][4]
-        if not dir_name.isdigit():
-            dir_name = mac_to_node_id(key)
-        else:
-            mac_to_code[key] = int(dir_name)
-        files_content[(key, dir_name)] = process_solo(value, min_time)  # type: ignore
-
-    # prepare events for config + enumerate non-present nodes
-    channel_events, off_events = parse_all_nodes(logs_by_uid.keys())
-
-    output_dir = os.path.abspath(args.path_to_output)
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    for key, value in files_content.items():
-        filename = f"{key[1]}_{key[0]}.txt"
-        with open(f"{output_dir}/{filename}", "w") as FD:
-            print_header(FD)
-            for line in value:
-                FD.write(line + "\n")
-        parsed_list.append(filename)
-
-    if args.generate_config:
-        create_config_file(output_dir, channel_events, off_events)
-
-    print(f"Parsed successfully. Check results in {output_dir}.\nParsed files are:")
-    print(parsed_list)
+    main(logs_path, output_dir, int(args.duration))

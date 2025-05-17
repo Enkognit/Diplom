@@ -29,17 +29,17 @@ public:
 
     // Transport -> Instance
 
-    virtual void NotifyNewNeighbour(TransportId, PeerId) const {}
+    virtual void NotifyNewNeighbour(TransportId, PeerId) {}
 
-    virtual void NotifyLostNeighbour(TransportId, PeerId) const {}
+    virtual void NotifyLostNeighbour(TransportId, PeerId) {}
 
-    virtual void NotifySessionOpened(TransportId, PeerId, LinkDirection) const {}
+    virtual void NotifySessionOpened(TransportId, PeerId, LinkDirection) {}
 
-    virtual void NotifyError(TransportId, PeerId, Error) const {}
+    virtual void NotifyError(TransportId, PeerId, Error) {}
 
-    virtual void NotifySessionLost(TransportId, PeerId, LinkDirection) const {}
+    virtual void NotifySessionLost(TransportId, PeerId, LinkDirection) {}
 
-    virtual void ReceivedMessage(TransportId, PeerId, Message &&) const {}
+    virtual void ReceivedMessage(TransportId, PeerId, Message &&) {}
 
     // User -> Transport
 

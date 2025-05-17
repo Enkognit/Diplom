@@ -9,15 +9,20 @@
 #include <netinet/in.h>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/if_link.h>
+#include <netinet/tcp.h>
 
-#include "logging.h"
-#include "message.h"
-#include "peer_id.h"
+#include <logging.h>
+#include <message.h>
+#include <peer_id.h>
 #include <net/if.h>
 #include <ifaddrs.h>
 
@@ -117,31 +122,28 @@ namespace diplom::transport::ip::common
         }
     }
 
-    inline const char *get_interface_by_ip(struct in_addr *addr)
+    inline const char *get_interface_by_ip(struct in_addr addr)
     {
         struct ifaddrs *ifaddr, *ifa;
-        static char interface_name[4096];
+        static char interface_name[IF_NAMESIZE + 1];
 
         if (getifaddrs(&ifaddr) == -1)
         {
-            LOGI("Error receiving interfaces");
+            LOGE("Error receiving interfaces");
             return nullptr;
         }
 
-        LOGI("Trying receive interface of %s", inet_ntoa(*addr));
-
         for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
         {
-            LOGI("Interface");
             if (ifa->ifa_addr && ifa->ifa_netmask && ifa->ifa_addr->sa_family == AF_INET)
             {
                 auto ifaddr_in = (struct sockaddr_in *)ifa->ifa_addr;
                 auto ifaddr_mask = (struct sockaddr_in *)ifa->ifa_netmask;
-                if ((ifaddr_in->sin_addr.s_addr & (ifaddr_mask->sin_addr.s_addr)) == (addr->s_addr & (ifaddr_mask->sin_addr.s_addr)))
+                if ((ifaddr_in->sin_addr.s_addr & (ifaddr_mask->sin_addr.s_addr)) == (addr.s_addr & (ifaddr_mask->sin_addr.s_addr)))
                 {
                     strcpy(interface_name, ifa->ifa_name);
                     freeifaddrs(ifaddr);
-                    LOGI("Found interface: %s", interface_name);
+                    LOGD("Found interface: %s", interface_name);
                     return interface_name;
                 }
             }
@@ -149,6 +151,64 @@ namespace diplom::transport::ip::common
 
         freeifaddrs(ifaddr);
         return nullptr;
+    }
+
+    inline std::unordered_set<std::string> get_interfaces() {
+        struct ifaddrs *ifaddr, *ifa;
+        static char interface_name[IF_NAMESIZE + 1];
+
+        if (getifaddrs(&ifaddr) == -1)
+        {
+            LOGE("Error receiving interfaces");
+            return {};
+        }
+
+        std::unordered_set<std::string> interfaces;
+
+        for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
+        {
+            if (ifa->ifa_addr && ifa->ifa_netmask && ifa->ifa_addr->sa_family == AF_INET && (ifa->ifa_flags & IFF_UP))
+            {
+                auto ifaddr_in = (struct sockaddr_in *)ifa->ifa_addr;
+                auto ifaddr_mask = (struct sockaddr_in *)ifa->ifa_netmask;
+                strcpy(interface_name, ifa->ifa_name);
+                interfaces.insert(std::string(interface_name));
+            }
+        }
+
+        freeifaddrs(ifaddr);
+
+        return interfaces;
+    }
+
+    inline int create_netlink_socket() {
+        int netlink_socket_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE);
+        if (netlink_socket_fd < 0) {
+            return -1;
+        }
+    
+        struct sockaddr_nl addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.nl_family = AF_NETLINK;
+        addr.nl_groups = RTMGRP_LINK;  
+        addr.nl_pid = getpid();        
+    
+        if (bind(netlink_socket_fd, (struct sockaddr*)&addr, sizeof(addr))) {
+            close(netlink_socket_fd);
+            return -1;
+        }
+    
+        return netlink_socket_fd;
+    }
+
+    inline void clear_netlink_socker(int fd) {
+        static char buffer[BUFFER_LEN];
+        while (1) {
+            ssize_t len = recv(fd, buffer, BUFFER_LEN, 0);
+            if (len < 1) {
+                break;
+            }
+        }
     }
 
     inline int create_broadcast_socket(int port = UDP_PORT)
@@ -195,8 +255,20 @@ namespace diplom::transport::ip::common
             int opt = 1;
             if (setsockopt(tcp_socket_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)))
             {
+                close(tcp_socket_fd);
                 return -1;
             }
+        }
+
+        int opt = 1;
+        if (setsockopt(tcp_socket_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&opt, sizeof(int)) < 0) {
+            close(tcp_socket_fd);
+            return -1;
+        }
+
+        if (setsockopt(tcp_socket_fd, SOL_SOCKET, SO_OOBINLINE, (char *)&opt, sizeof(int)) < 0) {
+            close(tcp_socket_fd);
+            return -1;
         }
 
         struct sockaddr_in tcp_socket_address = {
@@ -264,21 +336,14 @@ namespace diplom::transport::ip::common
 
     inline std::pair<struct sockaddr_in, int> accept_client(int fd)
     {
-        LOGI("accept_client");
+        LOGD("accept_client");
         struct sockaddr_in client_address{};
         socklen_t client_addr_len = sizeof(client_address);
         int client_fd = accept(fd, (struct sockaddr *)&client_address, (socklen_t *)&client_addr_len);
         int flags;
         if (-1 == (flags = fcntl(fd, F_GETFL, 0)))
             flags = 0;
-        LOGI("get ifname");
-        const char *ifname = get_interface_by_ip(&client_address.sin_addr);
-        LOGI("got ifname: %s", ifname);
-        if (setsockopt(client_fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname)))
-        {
-            LOGI("Error binding fd=%d to device %s", client_fd, ifname);
-        }
-        LOGI("Okay");
+        LOGD("Okay");
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         return {client_address, client_fd};
     }

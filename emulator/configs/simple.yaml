@@ -1,0 +1,23 @@
+setup:
+  duration: 15
+  conn_latency: 1000
+  latency: 100
+  bandwidth: 1000
+init:
+  nodes_amount: 3
+  edges:
+    "1 2": {} 
+    "2 3": {} 
+mods:
+  - time: 5000
+    erase: [
+      "1 2"
+    ]
+  - time: 10000
+    add:
+      "1 3": {
+        conn_lat: 1000,
+        lat: 200,
+        bw: 100
+      }
+      

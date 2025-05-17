@@ -9,12 +9,14 @@
 #include <optional>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unordered_map>
 #include <vector>
 
 #include "epoll_loop.h"
 #include "ip_broadcast.h"
 #include "ip_transport.h"
 #include "ip_utils.h"
+#include "link_direction.h"
 #include "logging.h"
 
 #undef TAG
@@ -47,18 +49,15 @@ std::vector<in_addr_t> GetBroadcastAddresses()
     struct ifaddrs *ifaddr_list = nullptr;
     struct ifaddrs *ifa = nullptr;
 
-    // Get the list of interfaces
     if (getifaddrs(&ifaddr_list) == -1) {
         return {};
     }
 
-    // Iterate through the linked list of interfaces
     for (ifa = ifaddr_list; ifa != nullptr; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == nullptr || ifa->ifa_netmask == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
             continue;
         }
 
-        // 2. Check interface flags: Must be UP, support BROADCAST, and NOT be LOOPBACK
         if (!((ifa->ifa_flags & IFF_UP) && (ifa->ifa_flags & IFF_BROADCAST) && !(ifa->ifa_flags & IFF_LOOPBACK))) {
             continue;
         }
@@ -69,15 +68,10 @@ std::vector<in_addr_t> GetBroadcastAddresses()
         in_addr_t ip_addr_n = addr_in->sin_addr.s_addr;
         in_addr_t netmask_n = netmask_in->sin_addr.s_addr;
 
-        // Calculate broadcast address: ip | (~netmask)
-        // The calculation works correctly with network byte order values.
         in_addr_t broadcast_addr_n = ip_addr_n | (~netmask_n);
-
-        // Add the calculated broadcast address (in network byte order) to the vector
         broadcast_addresses.push_back(broadcast_addr_n);
     }
 
-    // Free the memory allocated by getifaddrs
     freeifaddrs(ifaddr_list);
 
     return broadcast_addresses;
@@ -126,7 +120,26 @@ bool BroadcastManager::Start()
         return false;
     }
 
-    // Send broadcast immediately after start, don't wait next timer invocation.
+    LOGD("Creating netlink socket");
+
+    if ((netlinkFd_ = common::create_netlink_socket()) == -1) {
+        LOGE("Failed to create netlink socket");
+        return false;
+    }
+
+    auto cb_nl = [this](EpollResult res) { ProcessNetworkUpdate(); }; 
+
+    CancellationToken nl_tok = 0;
+    if (!loop_->RegisterAction(netlinkFd_, IoDirection::INPUT, cb_nl, nl_tok)) {
+        LOGE("Failed to set callback for netlink socket");
+        loop_->DeregisterAction(timer_tok);
+        loop_->DeregisterAction(br_tok);
+        close(netlinkFd_);
+        close(broadcastTimerFd_);
+        close(broadcastFd_);
+        return false;
+    }
+
     SendBroadcastHello();
 
     return true;
@@ -168,6 +181,30 @@ void BroadcastManager::ReceiveBroadcasts()
     LOGD("Done");
 }
 
+void BroadcastManager::ProcessNetworkUpdate() {
+    LOGI("Processing network interfaces changes");
+
+    common::clear_netlink_socker(netlinkFd_);
+
+    auto ifs = common::get_interfaces();
+    std::vector<std::string> removed;
+    for (auto &&[ifname, pid] : ifToPeer_) {
+        if (ifs.find(ifname) == ifs.end()) {
+            removed.push_back(ifname);
+            ipTransport_->CloseSession(pid, LinkDirection::ALL);
+            ipTransport_->OnNeighborLost(pid);
+        }
+    }
+
+    for (auto ifname : removed) {
+        ifToPeer_.erase(ifname);
+    }
+
+    SendBroadcastHello();
+    
+    LOGD("Done");
+}
+
 void BroadcastManager::ProcessHello(struct in_addr sender, HelloMsg const &msg, bool needNotify)
 {
     LOGD("Start processing hello message. peer: %s addr: %s", PeerIdToString(msg.id).c_str(),
@@ -197,7 +234,7 @@ void BroadcastManager::ProcessHello(struct in_addr sender, HelloMsg const &msg, 
 
         CancellationToken token = 0;
         if (!loop_->RegisterAction(tfd, IoDirection::INPUT, cb, token)) {
-            LOGE("Failed to register action for neigbor timer");
+            LOGE("Failed to register action for neigbour timer");
             return;
         }
 
@@ -207,6 +244,8 @@ void BroadcastManager::ProcessHello(struct in_addr sender, HelloMsg const &msg, 
             fdToPeer_.emplace(tfd, std::make_pair(msg.id, token));
             peerToAddr_[msg.id] = sender;
             addrToPeer_[sender.s_addr] = msg.id;
+            auto ifname = common::get_interface_by_ip(sender);
+            ifToPeer_[ifname] = msg.id;
         }
 
         LOGD("Found peer: %s on address %s", PeerIdToString(msg.id).c_str(), common::in_addr_to_string(sender).c_str());
@@ -245,8 +284,6 @@ void BroadcastManager::ProcessPeerLost(int fd)
 
 BroadcastManager::~BroadcastManager()
 {
-    // loop_->RemoveDescriptor(broadcastTimerFd_);
-    // loop_->RemoveDescriptor(broadcastFd_);
     close(broadcastTimerFd_);
     close(broadcastFd_);
 }

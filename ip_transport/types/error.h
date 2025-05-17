@@ -6,9 +6,8 @@
 #include <string>
 #include <utility>
 #include <variant>
-
-#include "link_direction.h"
-#include "logging.h"
+#include <link_direction.h>
+#include <logging.h>
 
 namespace diplom {
 

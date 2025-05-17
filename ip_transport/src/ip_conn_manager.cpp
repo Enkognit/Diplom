@@ -171,7 +171,7 @@ namespace diplom::transport::ip
                 ReadMessage(async_fd->Release());
             };
 
-            async_fd->SendMessage(std::move(msg), cb);
+            async_fd->SendMessage(std::move(msg), cb, false);
         };
         async_fd->RecvMessage(cb);
     }
@@ -253,7 +253,7 @@ namespace diplom::transport::ip
             };
             async_fd->RecvMessage(cb);
         };
-        async_fd->SendMessage(std::move(msg), cb);
+        async_fd->SendMessage(std::move(msg), cb, false);
     }
 
     void ConnectionManager::EstablishConnection(PeerId peer)

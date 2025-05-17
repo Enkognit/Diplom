@@ -25,9 +25,15 @@ namespace diplom::transport::ip {
 template <typename T> using ResolveFunction = std::function<void(const T &)>;
 
 struct SendFunctor {
+
+    bool urgent = true;
+
+    constexpr SendFunctor() = default;
+    constexpr SendFunctor(bool urg) : urgent(urg) {}
+
     ssize_t operator()(int fd, char *buf, size_t len)
     {
-        return send(fd, buf, len, MSG_NOSIGNAL);
+        return send(fd, buf, len, MSG_NOSIGNAL | (this->urgent ? MSG_OOB : 0));
     }
 };
 
@@ -119,7 +125,7 @@ public:
         return true;
     }
 
-    bool SendMessage(Message &&data, const ResolveFunction<IoResult<std::monostate>> &resolve)
+    bool SendMessage(Message &&data, const ResolveFunction<IoResult<std::monostate>> &resolve, bool urgent = true)
     {
         if (token_) {
             LOGE("[%d] Operation for this object already registered.", fd_);
@@ -137,7 +143,7 @@ public:
         std::memcpy(msg_len_buf->data(), &msg_len, sizeof(msg_len));
 
         // called after sending length of Message
-        auto send_data = [this, self, msg_len_buf, sdata, resolve](IoResult<std::monostate> res_len) {
+        auto send_data = [this, self, msg_len_buf, sdata, resolve, urgent](IoResult<std::monostate> res_len) {
             if (res_len.IsErr()) {
                 LOGE("SendMessage: [%d] Failed to send message length", fd_);
                 Deregister();
@@ -160,9 +166,9 @@ public:
                 Deregister();
                 resolve(res_data);
             };
-            ProcData(SendFunctor(), reinterpret_cast<char *>(sdata->data()), sdata->size(), EPOLLOUT, cb);
+            ProcData(SendFunctor(urgent), reinterpret_cast<char *>(sdata->data()), sdata->size(), EPOLLOUT, cb);
         };
-        ProcData(SendFunctor(), msg_len_buf->data(), sizeof(uint32_t), EPOLLOUT, send_data);
+        ProcData(SendFunctor(urgent), msg_len_buf->data(), sizeof(uint32_t), EPOLLOUT, send_data);
 
         return true;
     }
@@ -256,7 +262,7 @@ private:
             }
             LOGT("[%d] Got token: %u", fd_, token_);
         } else {
-            LOGT("Replacing aciton");
+            LOGT("Replacing action");
             if (!loop_->ReplaceAction(token_, cb)) {
                 LOGE("[%d] Failed to replace action", fd_);
                 resolve(IoResult<std::monostate>::Err(IoError::Error));

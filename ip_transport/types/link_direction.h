@@ -1,7 +1,7 @@
 #ifndef LINKDIR_H
 #define LINKDIR_H
 
-#include "common.h"
+#include <common.h>
 #include <type_traits>
 
 namespace diplom {

@@ -1,7 +1,6 @@
 #ifndef MESSAGE_H
 #define MESSAGE_H
 
-#include "common.h"
 #include <cstddef>
 #include <cstring>
 #include <iomanip>
