@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="resource/favicon.ico" sizes="any">
+    <link rel="icon" href="resource/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="css/style.css">
+    <title>Network Topology Visualizer</title>
+</head>
+<body>
+    <div id="container">
+        <h1>Network Topology Visualizer</h1>
+        <input type="file" id="file-input" accept=".txt">
+        <div id="topology">
+            <svg width="100%" height="100%">
+                <defs>
+                    <marker id="arrowhead-green" markerWidth="10" markerHeight="7" 
+                    refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#2ecc71"/>
+                    </marker>
+                </defs>
+            </svg>
+        </div>
+        <div id="time-display">Time: 0.000s</div>
+        <input type="range" id="timeline" min="0" max="100" value="0" step="0.1">
+        <div class="controls">
+            <button id="play-btn">Play</button>
+            <button id="pause-btn">Pause</button>
+            <button id="reset-btn">Reset</button>
+            <span>Speed: </span>
+            <select id="speed-select">
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+                <option value="2">2x</option>
+                <option value="5">5x</option>
+            </select>
+        </div>
+    </div>
+
+    <script>
+        let nodes = [];
+        let edges = [];
+        let events = [];
+        let maxTime = 0;
+        let currentTime = 0;
+        let animationId = null;
+        let isPlaying = false;
+        let speed = 1;
+        const NODE_RADIUS = 20;
+
+        const fileInput = document.getElementById('file-input');
+        const topologySvg = document.querySelector('#topology svg');
+        const timeDisplay = document.getElementById('time-display');
+        const timeline = document.getElementById('timeline');
+        const playBtn = document.getElementById('play-btn');
+        const pauseBtn = document.getElementById('pause-btn');
+        const resetBtn = document.getElementById('reset-btn');
+        const speedSelect = document.getElementById('speed-select');
+
+        fileInput.addEventListener('change', handleFileUpload);
+        timeline.addEventListener('input', handleTimelineChange);
+        playBtn.addEventListener('click', startAnimation);
+        pauseBtn.addEventListener('click', pauseAnimation);
+        resetBtn.addEventListener('click', resetAnimation);
+        speedSelect.addEventListener('change', updateSpeed);
+
+        function updateSpeed() {
+            speed = parseFloat(speedSelect.value);
+        }
+
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const content = e.target.result;
+                parseInput(content);
+                renderTopology();
+                updateTimelineMax();
+            };
+            reader.readAsText(file);
+        }
+
+        function parseInput(content) {
+            nodes = [];
+            edges = [];
+            events = [];
+            maxTime = 0;
+            const lines = content.split('\n');
+            let parsingNodes = true;
+            for (const line of lines) {
+                if (line.trim() === '') {
+                    parsingNodes = false;
+                    continue;
+                }
+                if (parsingNodes) {
+                    let [num, ...rest] = line.split(':');
+                    const nodeId = parseInt(num);
+                    const mac = rest.join(':').trim();
+                    nodes.push({ id: nodeId, mac: mac });
+                } else {
+                    const eventMatch = line.match(/\[(\d+):(\d+):(\d+\.\d+)\] (\d+) (->|\|>|<>|><) (\d+)/);
+                    if (eventMatch) {
+                        const hours = parseFloat(eventMatch[1]);
+                        const minutes = parseFloat(eventMatch[2]);
+                        const seconds = parseFloat(eventMatch[3]);
+                        const totalSeconds = hours * 3600 + minutes * 60 + seconds;
+                        const fromNode = parseInt(eventMatch[4]);
+                        const action = eventMatch[5];
+                        const toNode = parseInt(eventMatch[6]);
+                        events.push({
+                            time: totalSeconds,
+                            from: fromNode,
+                            action: action,
+                            to: toNode
+                        });
+                        if (totalSeconds > maxTime) {
+                            maxTime = totalSeconds;
+                        }
+                    }
+                }
+            }
+
+            events.sort((a, b) => a.time - b.time);
+        }
+
+        function renderTopology() {
+            topologySvg.innerHTML = `
+                <defs>
+                    <marker id="arrowhead-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                        <polygon points="0 0, 10 3.5, 0 7" fill="#2ecc71"/>
+                    </marker>
+                </defs>
+            `;
+            
+            const centerX = topologySvg.clientWidth / 2;
+            const centerY = topologySvg.clientHeight / 2;
+            const radius = Math.min(centerX, centerY) - 60;
+            nodes.forEach((node, index) => {
+                const angle = (index * 2 * Math.PI) / nodes.length;
+                const x = centerX + radius * Math.cos(angle);
+                const y = centerY + radius * Math.sin(angle);
+
+                const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                circle.setAttribute("cx", x);
+                circle.setAttribute("cy", y);
+                circle.setAttribute("r", NODE_RADIUS);
+                circle.setAttribute("fill", "#3498db");
+                circle.setAttribute("class", "node");
+                circle.setAttribute("data-id", node.id);
+                topologySvg.appendChild(circle);
+
+                const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                text.setAttribute("x", x);
+                text.setAttribute("y", y + 5);
+                text.setAttribute("text-anchor", "middle");
+                text.setAttribute("fill", "white");
+                text.setAttribute("font-weight", "bold");
+                text.textContent = node.id;
+                topologySvg.appendChild(text);
+            });
+        }
+
+        function updateTimelineMax() {
+            timeline.max = maxTime;
+            timeline.step = (maxTime / 1000).toFixed(3);
+        }
+
+        function handleTimelineChange() {
+            currentTime = parseFloat(timeline.value);
+            timeDisplay.textContent = `Time: ${currentTime.toFixed(3)}s`;
+            updateTopology(currentTime);
+        }
+
+        function updateTopology(time) {
+            document.querySelectorAll('.edge-path').forEach(el => el.remove());
+            const activeEdges = new Map();
+            const discoveryEvents = [];
+
+            for (const event of events) {
+                if (event.time > time) break;
+                const edgeName = `${event.from}-${event.to}`;
+                const reverseEdgeName = `${event.to}-${event.from}`;
+                if (event.action === '->') {
+                    activeEdges.set(edgeName, { from: event.from, to: event.to });
+                } else if (event.action === '|>') {
+                    activeEdges.delete(edgeName);
+                } else if (event.action === '<>') {
+                    discoveryEvents.push({
+                        from: event.from,
+                        to: event.to,
+                        type: 'discover'
+                    });
+                } else if (event.action === '><') {
+                    const index = discoveryEvents.findIndex(e => 
+                        (e.from === event.from && e.to === event.to || e.to === event.from && e.from === event.to) && e.type === 'discover');
+                    if (index !== -1) {
+                        discoveryEvents.splice(index, 1);
+                    }
+                }
+            }
+
+            const edgeCounts = {};
+            activeEdges.forEach(edge => {
+                const key = `${edge.from}-${edge.to}`;
+                edgeCounts[key] = (edgeCounts[key] || 0) + 1;
+            });
+
+            discoveryEvents.forEach(event => {
+                drawEdge(event.from, event.to, 1, 0, 'discovery');
+            });
+
+            activeEdges.forEach(edge => {
+                const key = `${edge.from}-${edge.to}`;
+                const count = edgeCounts[key];
+                const index = Array.from(activeEdges.keys()).filter(k => k === key).indexOf(key);
+                
+                drawEdge(edge.from, edge.to, count, index, 'active');
+            });
+        }
+
+        function drawEdge(fromId, toId, totalEdges, edgeIndex, edgeType) {
+            const fromNode = document.querySelector(`circle[data-id="${fromId}"]`);
+            const toNode = document.querySelector(`circle[data-id="${toId}"]`);
+            if (!fromNode || !toNode) return;
+            const x1 = parseFloat(fromNode.getAttribute("cx"));
+            const y1 = parseFloat(fromNode.getAttribute("cy"));
+            const x2 = parseFloat(toNode.getAttribute("cx"));
+            const y2 = parseFloat(toNode.getAttribute("cy"));
+            const dx = x2 - x1;
+            const dy = y2 - y1;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const angle = Math.atan2(dy, dx);
+            const startX = x1 + NODE_RADIUS * Math.cos(angle);
+            const startY = y1 + NODE_RADIUS * Math.sin(angle);
+            const endX = x2 - NODE_RADIUS * Math.cos(angle);
+            const endY = y2 - NODE_RADIUS * Math.sin(angle);
+
+            let curveFactor = 0;
+            if (totalEdges > 1 && edgeType === 'active') {
+                curveFactor = (edgeIndex - (totalEdges - 1)/2) * 30;
+            }
+
+            const ctrlX = (startX + endX) / 2 + Math.cos(angle + Math.PI/2) * curveFactor;
+            const ctrlY = (startY + endY) / 2 + Math.sin(angle + Math.PI/2) * curveFactor;
+
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            path.setAttribute("class", `edge-path ${edgeType === 'active' ? 'active-edge' : 'discovery-edge'}`);
+            const arrowAngle = Math.atan2(endY - ctrlY, endX - ctrlX);
+            const arrowX = endX;
+            const arrowY = endY;
+            path.setAttribute("d", `M${startX},${startY} Q${ctrlX},${ctrlY} ${arrowX},${arrowY}`);
+            topologySvg.appendChild(path);
+        }
+
+        function startAnimation() {
+            if (isPlaying) return;
+            isPlaying = true;
+            const startTime = performance.now() - currentTime * 1000;
+            function animate(currentAnimTime) {
+                if (!isPlaying) return;
+                const elapsed = (currentAnimTime - startTime) / 1000 * speed;
+                if (elapsed > maxTime) {
+                    currentTime = maxTime;
+                    isPlaying = false;
+                } else {
+                    currentTime = elapsed;
+                }
+                timeline.value = currentTime;
+                timeDisplay.textContent = `Time: ${currentTime.toFixed(3)}s`;
+                updateTopology(currentTime);
+                if (isPlaying && currentTime < maxTime) {
+                    animationId = requestAnimationFrame(animate);
+                }
+            }
+
+            animationId = requestAnimationFrame(animate);
+        }
+
+        function pauseAnimation() {
+            isPlaying = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+        }
+
+        function resetAnimation() {
+            pauseAnimation();
+            currentTime = 0;
+            timeline.value = 0;
+            timeDisplay.textContent = `Time: 0.000s`;
+            updateTopology(0);
+        }
+    </script>
+</body>
+</html>

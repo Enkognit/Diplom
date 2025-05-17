@@ -1,5 +1,6 @@
 build
 .vscode
 .cache
-visualizer
-emulator/result
+emulator/results
+emulator/emvenv
+emulator/__pycache__
