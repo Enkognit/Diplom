@@ -12,7 +12,7 @@
 
 using namespace diplom;
 
-struct MyTransportManager : transport::BasicTransportManager {
+struct TransportManager : transport::BasicTransportManager {
 
     void NotifyNewNeighbour(TransportId tid, PeerId pid) override {
         LOGI("Found neighbour pid: %s on tid: %d", PeerIdToString(pid).c_str(),
@@ -29,8 +29,8 @@ struct MyTransportManager : transport::BasicTransportManager {
                              LinkDirection ldir) override {
         LOGI("Got %s connection to neighbour pid: %s on tid: %d",
              ToString(ldir), PeerIdToString(pid).c_str(), tid);
-        Message msg{std::byte(1)};
-        SendMessage(tid, pid, std::move(msg));
+        // Message msg{std::byte(1)};
+        // SendMessage(tid, pid, std::move(msg));
     }
 
     void NotifySessionLost(TransportId tid, PeerId pid,
@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
     int i = std::atoi(argv[1]);
     int duration = std::atoi(argv[2]);
 
-    MyTransportManager manager;
+    TransportManager manager;
     transport::ip::IpTransport transport;
 
     PeerId self{};

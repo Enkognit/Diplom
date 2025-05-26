@@ -1,0 +1,15 @@
+setup:
+  duration: 10
+  conn_latency: 1000
+  latency: 200
+  bandwidth: 10000
+init:
+  nodes_amount: 2
+  edges:
+    "1 2": {} 
+mods:
+  - time: 5000
+    erase: [
+      "1 2"
+    ]
+      

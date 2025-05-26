@@ -2,7 +2,7 @@ setup:
   duration: 15
   conn_latency: 1000
   latency: 100
-  bandwidth: 1000
+  bandwidth: 10000
 init:
   nodes_amount: 3
   edges:
@@ -16,8 +16,8 @@ mods:
   - time: 10000
     add:
       "1 3": {
-        conn_lat: 1000,
+        conn_lat: 2000,
         lat: 200,
-        bw: 100
+        bw: 1000
       }
       
