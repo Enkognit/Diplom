@@ -1,7 +1,7 @@
 setup:
   duration: 10
-  conn_latency: 1000
-  latency: 200
+  conn_latency: [1200, 100]
+  latency: [20, 10]
   bandwidth: 1000
 init:
   nodes_amount: 5

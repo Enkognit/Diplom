@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 import ipaddress
 import combine_logs
@@ -8,10 +9,10 @@ import subprocess
 import sys
 import os
 import asyncio
-import time
 import logging
 import argparse
 import yaml
+
 from typing import Union, List, Dict, Any, Tuple
 
 import docker
@@ -25,6 +26,7 @@ from ipaddress import ip_network
 BASE_IMAGE = "emulator_image"
 SUBNET_POOL_BASE = "10.0.0.0/8"
 SUBNET_PREFIX = 24
+MAX_WORKERS = 10
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
@@ -224,7 +226,6 @@ class ExperimentConfigParser:
 
         return ExperimentConfig(setup=setup, init=init, mods=mods)
 
-
 class TrafficShaper:
 
     def __init__(self, interface):
@@ -236,36 +237,44 @@ class TrafficShaper:
         self.clear_rules()
         
         syn_delay_ms = copy.copy(conn_delay)
-        psh_delay_ms = copy.copy(trans_delay)
+        urg_delay_ms = copy.copy(trans_delay)
         
-        syn_delay_ms.mean -= psh_delay_ms.mean
-        syn_delay_ms.jitter = abs(syn_delay_ms.jitter - psh_delay_ms.jitter)
+        syn_delay_ms.mean -= urg_delay_ms.mean
+        syn_delay_ms.jitter = abs(syn_delay_ms.jitter - urg_delay_ms.jitter)
         
         if syn_delay_ms.mean < 0:
             raise Exception("conn_lat must be > then lat")
 
         try:
+#             command = f"""sudo tc qdisc add dev {self.interface} root handle 1: prio
+# sudo tc qdisc add dev {self.interface} parent 1:1 handle 10: netem delay {syn_delay_ms.mean}ms {syn_delay_ms.jitter}ms
+# sudo tc qdisc add dev {self.interface} parent 1:2 handle 20: netem delay {urg_delay_ms.mean}ms {urg_delay_ms.jitter}ms rate {bandwidth_kbps}kbit
+# sudo tc qdisc add dev {self.interface} parent 1:3 handle 30: pfifo_fast
+# sudo iptables -t mangle -A FORWARD -j MARK --set-mark 10
+# sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 10 handle 10 fw flowid 1:3
+# sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags URG URG -j MARK --set-mark 2
+# sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 2 handle 2 fw flowid 1:2
+# sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags FIN FIN -j MARK --set-mark 3
+# sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 3 handle 3 fw flowid 1:2
+# sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,ACK SYN -j MARK --set-mark 1
+# sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 1 handle 1 fw flowid 1:1"""
+#             print(command)
+#             shell(command)
             shell(
                 f"sudo tc qdisc add dev {self.interface} root handle 1: prio")
             shell(
-                f"sudo tc qdisc add dev {self.interface} parent 1:1 handle 10: netem delay {syn_delay_ms.mean}ms {syn_delay_ms.jitter}ms rate {bandwidth_kbps}kbit"
+                f"sudo tc qdisc add dev {self.interface} parent 1:1 handle 10: netem delay {syn_delay_ms.mean}ms {syn_delay_ms.jitter}ms"
             )
             shell(
-                f"sudo tc qdisc add dev {self.interface} parent 1:2 handle 20: netem delay {psh_delay_ms.mean}ms {psh_delay_ms.jitter}ms rate {bandwidth_kbps}kbit"
+                f"sudo tc qdisc add dev {self.interface} parent 1:2 handle 20: netem delay {urg_delay_ms.mean}ms {urg_delay_ms.jitter}ms rate {bandwidth_kbps}kbit"
             )
             shell(
                 f"sudo tc qdisc add dev {self.interface} parent 1:3 handle 30: pfifo_fast"
             )
-            shell(f"sudo iptables -t mangle -A FORWARD -j MARK --set-mark 3")
+            # ALL
+            shell(f"sudo iptables -t mangle -A FORWARD -j MARK --set-mark 10")
             shell(
-                f"sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 3 handle 3 fw flowid 1:3"
-            )
-            # SYN
-            shell(
-                f"sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,ACK SYN -j MARK --set-mark 1"
-            )
-            shell(
-                f"sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 1 handle 1 fw flowid 1:1"
+                f"sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 10 handle 10 fw flowid 1:3"
             )
             # URG
             shell(
@@ -274,8 +283,20 @@ class TrafficShaper:
             shell(
                 f"sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 2 handle 2 fw flowid 1:2"
             )
-            # 
-            
+            # FIN
+            shell(
+                f"sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags FIN FIN -j MARK --set-mark 3"
+            )
+            shell(
+                f"sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 3 handle 3 fw flowid 1:2"
+            )
+            # SYN
+            shell(
+                f"sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,ACK SYN -j MARK --set-mark 1"
+            )
+            shell(
+                f"sudo tc filter add dev {self.interface} parent 1:0 protocol ip prio 1 handle 1 fw flowid 1:1"
+            )
 
         except subprocess.CalledProcessError as e:
             logging.error("Error shaping interface:", e.stdout, e.stderr)
@@ -326,7 +347,7 @@ class ExperimentRunner:
         if u > v:
             u, v = v, u
         network_name = f"net_{u}_{v}"
-        logging.info(f"Adding {network_name}")
+        # logging.info(f"Adding {network_name}")
         if network_name not in self.bridges.keys():
             try:
                 container_u = self.containers.get(u)
@@ -385,7 +406,7 @@ class ExperimentRunner:
                 self.cleanup()
                 sys.exit(1)
 
-    async def bridge_up(self, edge: Edge, props: EdgeProperties):
+    def bridge_up(self, edge: Edge, props: EdgeProperties):
         u, v = edge
         if u > v:
             u, v = v, u
@@ -395,6 +416,7 @@ class ExperimentRunner:
 
         if network_name in self.bridges.keys():
             try:
+                # logging.info("Start up " + network_name)
                 container_u = self.containers.get(u)
                 container_v = self.containers.get(v)
                 ip_u = container_u.attrs['NetworkSettings']['Networks'][network_name]['IPAddress']
@@ -405,13 +427,29 @@ class ExperimentRunner:
                 self.shapers.update({network_name: TrafficShaper(interface)})
                 self.shapers[network_name].set_rules(props.conn_lat, props.lat, props.bw)
                 
-                container_u.exec_run(f'sh -c \'ip link set {self.get_interface_from_container(container_u, ip_u)} up && ip route add {ip_v} via {ip_h}\'')
-                container_v.exec_run(f'sh -c \'ip link set {self.get_interface_from_container(container_v, ip_v)} up && ip route add {ip_u} via {ip_h}\'')
+                # logging.info("Hih up " + network_name)
+                
+                eth_u = self.get_interface_from_container(container_u, ip_u)
+                eth_v = self.get_interface_from_container(container_v, ip_v)
+                
+                # logging.info("Mid up " + network_name)
+                
+                # print(container_v.exec_run(f'sh -c \'iptables -A INPUT -i {eth_v} -j DROP && iptables -A OUTPUT -o {eth_v} -j DROP && ip link set {eth_v} up && ip route add {ip_u} via {ip_h} && iptables-save | grep -v -- \'-i eth1\\|-o eth1\' | iptables-restore && ip link show\''))
+                # if self.start_time:
+                #     print("Shaping " + network_name, (datetime.now() - self.start_time).total_seconds())
+                container_u.exec_run(f'sh -c \'ip link set {eth_u} up && ip route add {ip_v} via {ip_h}\'')
+                container_v.exec_run(f'sh -c \'ip link set {eth_v} up && ip route add {ip_u} via {ip_h}\'')
+                # container_u.exec_run(f'sh -c \'iptables -A INPUT -i {eth_u} -j DROP && ip link set {eth_u} up && ip route add {ip_v} via {ip_h}\'')
+                # container_v.exec_run(f'sh -c \'iptables -A INPUT -i {eth_v} -j DROP && ip link set {eth_v} up && ip route add {ip_u} via {ip_h}\'')
+                # container_u.exec_run(f'sh -c \'iptables -D INPUT -i {eth_u} -j DROP && ip link show\'')
+                # container_v.exec_run(f'sh -c \'iptables -D INPUT -i {eth_v} -j DROP && ip link show\'')
+                
+                # logging.info("End up " + network_name)
                 
             except e:
                 logging.error(f"Error: {e}")
 
-    async def bridge_down(self, edge: Edge):
+    def bridge_down(self, edge: Edge):
         u, v = edge
         if u > v:
             u, v = v, u
@@ -448,10 +486,9 @@ class ExperimentRunner:
         except Exception as e:
             logging.error(f"Error checking/pulling base image: {e}")
             sys.exit(1)
-
-        for i in range(1, num_containers + 1):
+            
+        def create_container(i):
             container_name = f"dist_node_{i}"
-
             try:
                 container = self.docker_client.containers.run(
                     BASE_IMAGE,
@@ -492,6 +529,9 @@ class ExperimentRunner:
                     f"Error creating container {container_name}: {e}")
                 self.cleanup()
                 sys.exit(1)
+            
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(create_container, range(1, num_containers + 1))
 
         logging.info(
             "Disconnecting containers from the default bridge network...")
@@ -567,29 +607,23 @@ class ExperimentRunner:
 
         # Setup bridges
         
+        self.start_time = None
+        
         bridges = []
         for edge, _ in config.init.edges.items():            
             bridges.append(edge)
             
         for mod in config.mods:
-            for edge, props in mod.add.items():
+            for edge, _ in mod.add.items():
                 bridges.append(edge)
         
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(self.add_bridge, bridges)
+            
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            executor.map(lambda x: self.bridge_up(x[0], x[1]), config.init.edges.items())
         
-        # Init    
-        async def init_conns():
-            tasks: List[asyncio.Task] = []
-            for edge, props in config.init.edges.items():
-                tasks.append(asyncio.create_task(self.bridge_up(edge, props)))
-
-            for task in tasks:
-                await task
-        
-        asyncio.run(init_conns())
-        
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(run_binary_in_device,
                          list(range(1, config.init.nodes_amount + 1)))
         
@@ -597,6 +631,8 @@ class ExperimentRunner:
         asyncio.run(self.run_exp(config))
         
     async def run_exp(self, config):
+        
+        self.start_time = datetime.now()
         
         async def delayed_task(task, delay):
             await asyncio.sleep(delay / 1000)
@@ -613,65 +649,40 @@ class ExperimentRunner:
             task.cancel()
 
     async def make_modification(self, mods: ExperimentMods):
-        tasks: List[asyncio.Task] = []
+        print("Mod start:", (datetime.now() - self.start_time).total_seconds())
         
-        for edge, props in mods.add.items():
-            tasks.append(asyncio.create_task(self.bridge_up(edge, props)))
-            
-        for edge in mods.erase:
-            tasks.append(asyncio.create_task(self.bridge_down(edge)))
-            
-        for task in tasks:
-            await task
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for edge, props in mods.add.items():
+                executor.submit(self.bridge_up, edge, props)
+            for edge in mods.erase:
+                executor.submit(self.bridge_down, edge)
+  
+        print("Mod end:", (datetime.now() - self.start_time).total_seconds())
         
 
     def cleanup(self):
         logging.info("Cleaning up resources...")
-
-        # async def remove_container(container):
-        #     try:
-        #         logging.info(f"Stopping container {container.name}...")
-        #         container.stop(timeout=0)
-        #     except Exception as e:
-        #         logging.warning(
-        #             f"Unexpected error stopping container {container.name}: {e}. Force removing."
-        #         )
-
-        # async def remove_all_containers():
-        #     tasks = [
-        #         remove_container(container)
-        #         for container in self.containers.values()
-        #     ]
-        #     for task in tasks:
-        #         await task
-
-        # asyncio.run(remove_all_containers())
-
+        
+        processes = []
         for container in self.containers.values():
-            try:
-                logging.info(f"Removing container {container.name}...")
-                try:
-                    container.reload()
-                except Exception:
-                    pass
-                if container.status != "removed":
-                    container.remove(force=True)
-            except Exception as e:
-                logging.error(
-                    f"Unexpected error removing container {container.name}: {e}"
-                )
-
+            proc = subprocess.Popen(['docker', 'rm', '-f', container.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            processes.append(proc)
+            
+        for proc in processes:
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                print(proc.returncode, stdout, stderr)
+        
+        processes = []
+        
         for network in self.bridges.values():
-            try:
-                logging.info(f"Removing network {network.name}...")
-                network.remove()
-            except docker.errors.NotFound:
-                logging.warning(f"Network {network.name} already removed.")
-            except docker.errors.APIError as e:
-                logging.error(f"Error removing network {network.name}: {e}")
-            except Exception as e:
-                logging.error(
-                    f"Unexpected error removing network {network.name}: {e}")
+            proc = subprocess.Popen(['docker', 'network', 'rm', '-f', network.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            processes.append(proc)
+        
+        for proc in processes:
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                print(proc.returncode, stdout, stderr)
 
         logging.info("Cleanup complete.")
 
