@@ -1,0 +1,10 @@
+setup:
+  duration: 15
+  conn_latency: 1000
+  latency: 20
+  bandwidth: 1000
+init:
+  nodes_amount: 3
+  edges:
+    1: [2, 3]
+    2: [3]

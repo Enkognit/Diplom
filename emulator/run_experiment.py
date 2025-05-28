@@ -26,14 +26,15 @@ from ipaddress import ip_network
 BASE_IMAGE = "emulator_image"
 SUBNET_POOL_BASE = "10.0.0.0/8"
 SUBNET_PREFIX = 24
-MAX_WORKERS = 10
+MAX_WORKERS = 100
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def shell(command):
-    return subprocess.run(command.split(),
+    return subprocess.run(command,
+                          shell=True,
                           check=True,
                           stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE)
@@ -102,14 +103,15 @@ class ExperimentSetup:
 @dataclass
 class ExperimentMods:
     time: int
-    add: Dict[Edge, EdgeProperties]
+    add: List[Edge]
     erase: List[Edge]
 
 
 @dataclass
 class ExperimentInit:
     nodes_amount: int
-    edges: Dict[Edge, EdgeProperties]
+    custom: Dict[Edge, EdgeProperties]
+    edges: List[Edge]
 
 
 @dataclass
@@ -154,12 +156,9 @@ class ExperimentConfigParser:
             return (min(redge), max(redge))
         else:
             raise err
-
-    def parse_edges(self, edges_data: Dict, setup: ExperimentSetup,
-                    nodes_amount: int) -> Dict[Edge, EdgeProperties]:
-        if not edges_data:
-            return {}
-        edges: Dict[Edge, EdgeProperties] = {}
+        
+    def parse_visib(self, edges_data: Dict, nodes_amount: int) -> List[Edge]:
+        edges = []
         for edge, params in edges_data.items():
             if isinstance(edge, int):
                 if edge < 1 or edge > nodes_amount:
@@ -173,32 +172,34 @@ class ExperimentConfigParser:
                             f"Node {i} is out of bounds")
                     redge = (edge, i)
                     redge = (min(redge), max(redge))
-                    edges[redge] = EdgeProperties(
-                        conn_lat=setup.conn_latency,
-                        lat=setup.latency,
-                        bw=setup.bandwidth)    
-            else:
-                edge = self.parse_edge(edge)
-                if min(edge) < 1 or max(edge) > nodes_amount:
-                    raise ValueError(
-                        f"Edge {edge[0]} - {edge[1]} is out of bounds")
-
-                edges[edge] = EdgeProperties(
-                    conn_lat=self.parse_network_value(params.get('conn_lat'),
-                                                    setup.conn_latency),
-                    lat=self.parse_network_value(params.get('lat'), setup.latency),
-                    bw=params.get('bw', setup.bandwidth))
+                    edges.append(redge)
         return edges
 
-    def parse_mods(self, mods_data: List[Dict], init: ExperimentInit,
-                   setup: ExperimentSetup) -> List[ExperimentMods]:
+    def parse_edges(self, edges_data: Dict, setup: ExperimentSetup,
+                    nodes_amount: int) -> Dict[Edge, EdgeProperties]:
+        if not edges_data:
+            return {}
+        edges: Dict[Edge, EdgeProperties] = {}
+        for edge, params in edges_data.items():
+            edge = self.parse_edge(edge)
+            if min(edge) < 1 or max(edge) > nodes_amount:
+                raise ValueError(
+                    f"Edge {edge[0]} - {edge[1]} is out of bounds")
+
+            edges[edge] = EdgeProperties(
+                conn_lat=self.parse_network_value(params.get('conn_lat'),
+                                                setup.conn_latency),
+                lat=self.parse_network_value(params.get('lat'), setup.latency),
+                bw=params.get('bw', setup.bandwidth))
+        return edges
+
+    def parse_mods(self, mods_data: List[Dict]) -> List[ExperimentMods]:
         mods: List[ExperimentMods] = []
         for mod in mods_data:
             mods.append(
                 ExperimentMods(
                     time=int(mod['time']),
-                    add=self.parse_edges(mod.get('add', {}), setup,
-                                         init.nodes_amount),
+                    add=[self.parse_edge(e) for e in mod.get('add', [])],
                     erase=[self.parse_edge(e) for e in mod.get('erase', [])]))
         return mods
 
@@ -219,10 +220,9 @@ class ExperimentConfigParser:
         init_data = config_data.get('init', {})
         nodes_amount = init_data.get('nodes_amount', NODES_AMOUNT)
         init = ExperimentInit(nodes_amount=nodes_amount,
-                              edges=self.parse_edges(
-                                  init_data.get('edges', {}), setup,
-                                  nodes_amount))
-        mods = self.parse_mods(config_data.get('mods', []), init, setup)
+                              custom=self.parse_edges(init_data.get('custom_shapes', {}), setup, nodes_amount),
+                              edges=self.parse_visib(init_data.get('edges', []), nodes_amount))
+        mods = self.parse_mods(config_data.get('mods', []))
 
         return ExperimentConfig(setup=setup, init=init, mods=mods)
 
@@ -233,8 +233,7 @@ class TrafficShaper:
 
     def set_rules(self, conn_delay: NetworkValue, trans_delay: NetworkValue,
                   bandwidth_kbps: int):
-        logging.info(f"Shaping {self.interface}")
-        self.clear_rules()
+        # logging.info(f"Shaping {self.interface}")
         
         syn_delay_ms = copy.copy(conn_delay)
         urg_delay_ms = copy.copy(trans_delay)
@@ -309,9 +308,6 @@ class TrafficShaper:
         except subprocess.CalledProcessError as e:
             pass
 
-    def __del__(self):
-        self.clear_rules()
-
 
 class ExperimentRunner:
 
@@ -327,7 +323,7 @@ class ExperimentRunner:
         self.shapers = {}
 
         try:
-            self.docker_client = docker.from_env()
+            self.docker_client = docker.DockerClient(max_pool_size=MAX_WORKERS, timeout=10)
             self.docker_client.ping()
             logging.info("Connected to Docker daemon.")
         except Exception as e:
@@ -342,12 +338,12 @@ class ExperimentRunner:
             if ip in line:
                 return line.split(' ')[1]
 
-    def add_bridge(self, edge: Edge):
+    def add_bridge(self, edge: Edge, props: EdgeProperties):
         u, v = edge
         if u > v:
             u, v = v, u
         network_name = f"net_{u}_{v}"
-        # logging.info(f"Adding {network_name}")
+        
         if network_name not in self.bridges.keys():
             try:
                 container_u = self.containers.get(u)
@@ -393,12 +389,9 @@ class ExperimentRunner:
                 network.connect(container_v, ipv4_address=ip_v)
                 container_v.exec_run(f'ip link set {self.get_interface_from_container(container_v, ip_v)} down')
 
-                # logging.info(
-                #     f"Connected container {container_u.name} to {network.name}"
-                # )
-                # logging.info(
-                #     f"Connected container {container_v.name} to {network.name}"
-                # )
+                interface = f"br-{self.docker_client.networks.get(network_name).attrs['Id'][:12]}"
+                self.shapers.update({network_name: TrafficShaper(interface)})
+                self.shapers[network_name].set_rules(props.conn_lat, props.lat, props.bw)
 
             except Exception as e:
                 logging.error(
@@ -406,7 +399,7 @@ class ExperimentRunner:
                 self.cleanup()
                 sys.exit(1)
 
-    def bridge_up(self, edge: Edge, props: EdgeProperties):
+    def bridge_up(self, edge: Edge):
         u, v = edge
         if u > v:
             u, v = v, u
@@ -422,12 +415,6 @@ class ExperimentRunner:
                 ip_u = container_u.attrs['NetworkSettings']['Networks'][network_name]['IPAddress']
                 ip_v = container_v.attrs['NetworkSettings']['Networks'][network_name]['IPAddress']
                 ip_h = self.bridges[network_name].attrs['IPAM']['Config'][0]['Gateway']
-                
-                interface = f"br-{self.docker_client.networks.get(network_name).attrs['Id'][:12]}"
-                self.shapers.update({network_name: TrafficShaper(interface)})
-                self.shapers[network_name].set_rules(props.conn_lat, props.lat, props.bw)
-                
-                # logging.info("Hih up " + network_name)
                 
                 eth_u = self.get_interface_from_container(container_u, ip_u)
                 eth_v = self.get_interface_from_container(container_v, ip_v)
@@ -464,8 +451,8 @@ class ExperimentRunner:
                 ip_u = container_u.attrs['NetworkSettings']['Networks'][network_name]['IPAddress']
                 ip_v = container_v.attrs['NetworkSettings']['Networks'][network_name]['IPAddress']
                 
-                container_u.exec_run(f'ip link set {self.get_interface_from_container(container_u, ip_u)} down')
-                container_v.exec_run(f'ip link set {self.get_interface_from_container(container_v, ip_v)} down')
+                print(container_u.exec_run(f'ip link set {self.get_interface_from_container(container_u, ip_u)} down'))
+                print(container_v.exec_run(f'ip link set {self.get_interface_from_container(container_v, ip_v)} down'))
                 
                 self.shapers.pop(network_name)
             except e:
@@ -609,19 +596,28 @@ class ExperimentRunner:
         
         self.start_time = None
         
-        bridges = []
-        for edge, _ in config.init.edges.items():            
-            bridges.append(edge)
+        def_props = EdgeProperties(
+            conn_lat=config.setup.conn_latency,
+            lat=config.setup.latency,
+            bw=config.setup.bandwidth
+        )
+        
+        bridges = dict()
+        for edge in config.init.edges:            
+            bridges[edge] = def_props
             
         for mod in config.mods:
-            for edge, _ in mod.add.items():
-                bridges.append(edge)
+            for edge in mod.add:
+                bridges[edge] = def_props
+                
+        for edge, props in config.init.custom.items():
+            bridges[edge] = props
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            executor.map(self.add_bridge, bridges)
+            executor.map(lambda x: self.add_bridge(x[0], x[1]), bridges.items())
             
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            executor.map(lambda x: self.bridge_up(x[0], x[1]), config.init.edges.items())
+            executor.map(self.bridge_up, config.init.edges)
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(run_binary_in_device,
@@ -652,8 +648,8 @@ class ExperimentRunner:
         print("Mod start:", (datetime.now() - self.start_time).total_seconds())
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for edge, props in mods.add.items():
-                executor.submit(self.bridge_up, edge, props)
+            for edge in mods.add:
+                executor.submit(self.bridge_up, edge)
             for edge in mods.erase:
                 executor.submit(self.bridge_down, edge)
   
@@ -663,26 +659,12 @@ class ExperimentRunner:
     def cleanup(self):
         logging.info("Cleaning up resources...")
         
-        processes = []
-        for container in self.containers.values():
-            proc = subprocess.Popen(['docker', 'rm', '-f', container.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            processes.append(proc)
-            
-        for proc in processes:
-            stdout, stderr = proc.communicate()
-            if proc.returncode != 0:
-                print(proc.returncode, stdout, stderr)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for _, shaper in self.shapers.items():
+                executor.submit(shaper.clear_rules)
         
-        processes = []
-        
-        for network in self.bridges.values():
-            proc = subprocess.Popen(['docker', 'network', 'rm', '-f', network.name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            processes.append(proc)
-        
-        for proc in processes:
-            stdout, stderr = proc.communicate()
-            if proc.returncode != 0:
-                print(proc.returncode, stdout, stderr)
+        logging.info(shell('docker rm -f $(docker ps -aq --filter "name=dist_node_")'))
+        logging.info(shell('docker network ls --filter name=net_ --format "{{.ID}}" | xargs -P 4 -n 1 -r docker network rm'))
 
         logging.info("Cleanup complete.")
 
@@ -726,6 +708,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     logs_num_path = logs_path / str(count_next_result_id(logs_path))
+    
+    os.mkdir(logs_num_path)
 
     experiment_config = ExperimentConfigParser().parse_config(config_path)
 
